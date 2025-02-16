@@ -140,6 +140,7 @@ mod dma_only {
             match raw {
                 Dir::MemoryToPeripheral => Self::MEMORY_TO_PERIPHERAL,
                 Dir::PeripheralToMemory => Self::PERIPHERAL_TO_MEMORY,
+                Dir::MemoryToMemory => Self::MEMORY_TO_MEMORY,
             }
         }
     }
@@ -340,6 +341,7 @@ impl AnyChannel {
         mem_addr: *mut u32,
         mem_len: usize,
         incr_mem: bool,
+        incr_peri: bool,
         mem_size: WordSize,
         peripheral_size: WordSize,
         options: TransferOptions,
@@ -368,8 +370,16 @@ impl AnyChannel {
                 state.complete_count.store(0, Ordering::Release);
                 self.clear_irqs();
 
-                ch.par().write_value(peri_addr as u32);
-                ch.m0ar().write_value(mem_addr as u32);
+                match dir {
+                    Dir::MemoryToMemory => {
+                        ch.par().write_value(mem_addr as u32); // source
+                        ch.m0ar().write_value(peri_addr as u32); // destination
+                    }
+                    _ => {
+                        ch.par().write_value(peri_addr as u32); // source
+                        ch.m0ar().write_value(mem_addr as u32); // destination
+                    }
+                }
                 ch.ndtr().write_value(pac::dma::regs::Ndtr(mem_len as _));
                 ch.fcr().write(|w| {
                     if let Some(fth) = options.fifo_threshold {
@@ -387,7 +397,7 @@ impl AnyChannel {
                     w.set_psize(peripheral_size.into());
                     w.set_pl(options.priority.into());
                     w.set_minc(incr_mem);
-                    w.set_pinc(false);
+                    w.set_pinc(incr_peri);
                     w.set_teie(true);
                     w.set_htie(options.half_transfer_ir);
                     w.set_tcie(options.complete_transfer_ir);
@@ -602,6 +612,7 @@ impl<'a> Transfer<'a> {
             buf as *mut W as *mut u32,
             buf.len(),
             true,
+            false,
             W::size(),
             W::size(),
             options,
@@ -635,6 +646,7 @@ impl<'a> Transfer<'a> {
             buf as *const MW as *mut u32,
             buf.len(),
             true,
+            false,
             MW::size(),
             PW::size(),
             options,
@@ -658,8 +670,47 @@ impl<'a> Transfer<'a> {
             repeated as *const W as *mut u32,
             count,
             false,
+            false,
             W::size(),
             W::size(),
+            options,
+        )
+    }
+
+    /// Create a new write DMA transfer (memory to memory).
+    pub unsafe fn new_copy<MW: Word, PW: Word>(
+        channel: Peri<'a, impl Channel>,
+        request: Request,
+        buf: &'a [MW],
+        peri_addr: *mut PW,
+        options: TransferOptions,
+        incr_mem: bool,
+        incr_peri: bool,
+    ) -> Self {
+        Self::new_copy_raw(channel, request, buf, peri_addr, options, incr_mem, incr_peri)
+    }
+
+    /// Create a new write DMA transfer (memory to peripheral), using raw pointers.
+    pub unsafe fn new_copy_raw<MW: Word, PW: Word>(
+        channel: Peri<'a, impl Channel>,
+        request: Request,
+        buf: *const [MW],
+        peri_addr: *mut PW,
+        options: TransferOptions,
+        incr_mem: bool,
+        incr_peri: bool,
+    ) -> Self {
+        Self::new_inner(
+            channel.into(),
+            request,
+            Dir::MemoryToMemory,
+            peri_addr as *const u32,
+            buf as *const MW as *mut u32,
+            buf.len(),
+            incr_mem,
+            incr_peri,
+            MW::size(),
+            PW::size(),
             options,
         )
     }
@@ -672,6 +723,7 @@ impl<'a> Transfer<'a> {
         mem_addr: *mut u32,
         mem_len: usize,
         incr_mem: bool,
+        incr_peri: bool,
         data_size: WordSize,
         peripheral_size: WordSize,
         options: TransferOptions,
@@ -685,6 +737,7 @@ impl<'a> Transfer<'a> {
             mem_addr,
             mem_len,
             incr_mem,
+            incr_peri,
             data_size,
             peripheral_size,
             options,
@@ -820,6 +873,7 @@ impl<'a, W: Word> ReadableRingBuffer<'a, W> {
             buffer_ptr as *mut u32,
             len,
             true,
+            false,
             data_size,
             data_size,
             options,
@@ -972,6 +1026,7 @@ impl<'a, W: Word> WritableRingBuffer<'a, W> {
             buffer_ptr as *mut u32,
             len,
             true,
+            false,
             data_size,
             data_size,
             options,

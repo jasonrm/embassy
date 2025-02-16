@@ -31,6 +31,7 @@ use crate::interrupt;
 enum Dir {
     MemoryToPeripheral,
     PeripheralToMemory,
+    MemoryToMemory,
 }
 
 /// DMA request type alias. (also known as DMA channel number in some chips)
