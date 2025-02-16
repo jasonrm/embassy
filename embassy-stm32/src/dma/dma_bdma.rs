@@ -140,6 +140,7 @@ mod dma_only {
             match raw {
                 Dir::MemoryToPeripheral => Self::MEMORY_TO_PERIPHERAL,
                 Dir::PeripheralToMemory => Self::PERIPHERAL_TO_MEMORY,
+                Dir::MemoryToMemory => Self::MEMORY_TO_MEMORY,
             }
         }
     }
@@ -286,15 +287,21 @@ impl AnyChannel {
                 let isr = r.isr(info.num / 4).read();
 
                 if isr.teif(info.num % 4) {
-                    panic!("DMA: error on DMA@{:08x} channel {}", r.as_ptr() as u32, info.num);
+                    panic!(
+                        "DMA: error on DMA@{:08x} channel {}",
+                        r.as_ptr() as u32,
+                        info.num
+                    );
                 }
 
                 if isr.htif(info.num % 4) && cr.read().htie() {
                     // Acknowledge half transfer complete interrupt
-                    r.ifcr(info.num / 4).write(|w| w.set_htif(info.num % 4, true));
+                    r.ifcr(info.num / 4)
+                        .write(|w| w.set_htif(info.num % 4, true));
                 } else if isr.tcif(info.num % 4) && cr.read().tcie() {
                     // Acknowledge  transfer complete interrupt
-                    r.ifcr(info.num / 4).write(|w| w.set_tcif(info.num % 4, true));
+                    r.ifcr(info.num / 4)
+                        .write(|w| w.set_tcif(info.num % 4, true));
                     state.complete_count.fetch_add(1, Ordering::Release);
                 } else {
                     return;
@@ -307,7 +314,11 @@ impl AnyChannel {
                 let cr = r.ch(info.num).cr();
 
                 if isr.teif(info.num) {
-                    panic!("DMA: error on BDMA@{:08x} channel {}", r.as_ptr() as u32, info.num);
+                    panic!(
+                        "DMA: error on BDMA@{:08x} channel {}",
+                        r.as_ptr() as u32,
+                        info.num
+                    );
                 }
 
                 if isr.htif(info.num) && cr.read().htie() {
@@ -340,6 +351,7 @@ impl AnyChannel {
         mem_addr: *mut u32,
         mem_len: usize,
         incr_mem: bool,
+        incr_peri: bool,
         mem_size: WordSize,
         peripheral_size: WordSize,
         options: TransferOptions,
@@ -368,8 +380,16 @@ impl AnyChannel {
                 state.complete_count.store(0, Ordering::Release);
                 self.clear_irqs();
 
-                ch.par().write_value(peri_addr as u32);
-                ch.m0ar().write_value(mem_addr as u32);
+                match dir {
+                    Dir::MemoryToMemory => {
+                        ch.par().write_value(mem_addr as u32); // source
+                        ch.m0ar().write_value(peri_addr as u32); // destination
+                    }
+                    _ => {
+                        ch.par().write_value(peri_addr as u32); // source
+                        ch.m0ar().write_value(mem_addr as u32); // destination
+                    }
+                }
                 ch.ndtr().write_value(pac::dma::regs::Ndtr(mem_len as _));
                 ch.fcr().write(|w| {
                     if let Some(fth) = options.fifo_threshold {
@@ -387,7 +407,7 @@ impl AnyChannel {
                     w.set_psize(peripheral_size.into());
                     w.set_pl(options.priority.into());
                     w.set_minc(incr_mem);
-                    w.set_pinc(false);
+                    w.set_pinc(incr_peri);
                     w.set_teie(true);
                     w.set_htie(options.half_transfer_ir);
                     w.set_tcie(options.complete_transfer_ir);
@@ -604,6 +624,7 @@ impl<'a> Transfer<'a> {
             buf as *mut W as *mut u32,
             buf.len(),
             true,
+            false,
             W::size(),
             W::size(),
             options,
@@ -639,6 +660,7 @@ impl<'a> Transfer<'a> {
             buf as *const MW as *mut u32,
             buf.len(),
             true,
+            false,
             MW::size(),
             PW::size(),
             options,
@@ -664,8 +686,51 @@ impl<'a> Transfer<'a> {
             repeated as *const W as *mut u32,
             count,
             false,
+            false,
             W::size(),
             W::size(),
+            options,
+        )
+    }
+
+    /// Create a new write DMA transfer (memory to memory).
+    pub unsafe fn new_copy<MW: Word, PW: Word>(
+        channel: impl Peripheral<P = impl Channel> + 'a,
+        request: Request,
+        buf: &'a [MW],
+        peri_addr: *mut PW,
+        options: TransferOptions,
+        incr_mem: bool,
+        incr_peri: bool,
+    ) -> Self {
+        Self::new_copy_raw(
+            channel, request, buf, peri_addr, options, incr_mem, incr_peri,
+        )
+    }
+
+    /// Create a new write DMA transfer (memory to peripheral), using raw pointers.
+    pub unsafe fn new_copy_raw<MW: Word, PW: Word>(
+        channel: impl Peripheral<P = impl Channel> + 'a,
+        request: Request,
+        buf: *const [MW],
+        peri_addr: *mut PW,
+        options: TransferOptions,
+        incr_mem: bool,
+        incr_peri: bool,
+    ) -> Self {
+        into_ref!(channel);
+
+        Self::new_inner(
+            channel.map_into(),
+            request,
+            Dir::MemoryToMemory,
+            peri_addr as *const u32,
+            buf as *const MW as *mut u32,
+            buf.len(),
+            incr_mem,
+            incr_peri,
+            MW::size(),
+            PW::size(),
             options,
         )
     }
@@ -678,6 +743,7 @@ impl<'a> Transfer<'a> {
         mem_addr: *mut u32,
         mem_len: usize,
         incr_mem: bool,
+        incr_peri: bool,
         data_size: WordSize,
         peripheral_size: WordSize,
         options: TransferOptions,
@@ -691,6 +757,7 @@ impl<'a> Transfer<'a> {
             mem_addr,
             mem_len,
             incr_mem,
+            incr_peri,
             data_size,
             peripheral_size,
             options,
@@ -827,6 +894,7 @@ impl<'a, W: Word> ReadableRingBuffer<'a, W> {
             buffer_ptr as *mut u32,
             len,
             true,
+            false,
             data_size,
             data_size,
             options,
@@ -847,7 +915,8 @@ impl<'a, W: Word> ReadableRingBuffer<'a, W> {
 
     /// Clear all data in the ring buffer.
     pub fn clear(&mut self) {
-        self.ringbuf.reset(&mut DmaCtrlImpl(self.channel.reborrow()));
+        self.ringbuf
+            .reset(&mut DmaCtrlImpl(self.channel.reborrow()));
     }
 
     /// Read elements from the ring buffer
@@ -856,7 +925,8 @@ impl<'a, W: Word> ReadableRingBuffer<'a, W> {
     /// The length remaining is the capacity, ring_buf.len(), less the elements remaining after the read
     /// Error is returned if the portion to be read was overwritten by the DMA controller.
     pub fn read(&mut self, buf: &mut [W]) -> Result<(usize, usize), Error> {
-        self.ringbuf.read(&mut DmaCtrlImpl(self.channel.reborrow()), buf)
+        self.ringbuf
+            .read(&mut DmaCtrlImpl(self.channel.reborrow()), buf)
     }
 
     /// Read an exact number of elements from the ringbuffer.
@@ -878,7 +948,9 @@ impl<'a, W: Word> ReadableRingBuffer<'a, W> {
 
     /// The current length of the ringbuffer
     pub fn len(&mut self) -> Result<usize, Error> {
-        Ok(self.ringbuf.len(&mut DmaCtrlImpl(self.channel.reborrow()))?)
+        Ok(self
+            .ringbuf
+            .len(&mut DmaCtrlImpl(self.channel.reborrow()))?)
     }
 
     /// The capacity of the ringbuffer
@@ -980,6 +1052,7 @@ impl<'a, W: Word> WritableRingBuffer<'a, W> {
             buffer_ptr as *mut u32,
             len,
             true,
+            false,
             data_size,
             data_size,
             options,
@@ -1000,7 +1073,8 @@ impl<'a, W: Word> WritableRingBuffer<'a, W> {
 
     /// Clear all data in the ring buffer.
     pub fn clear(&mut self) {
-        self.ringbuf.reset(&mut DmaCtrlImpl(self.channel.reborrow()));
+        self.ringbuf
+            .reset(&mut DmaCtrlImpl(self.channel.reborrow()));
     }
 
     /// Write elements directly to the raw buffer.
@@ -1012,7 +1086,8 @@ impl<'a, W: Word> WritableRingBuffer<'a, W> {
     /// Write elements from the ring buffer
     /// Return a tuple of the length written and the length remaining in the buffer
     pub fn write(&mut self, buf: &[W]) -> Result<(usize, usize), Error> {
-        self.ringbuf.write(&mut DmaCtrlImpl(self.channel.reborrow()), buf)
+        self.ringbuf
+            .write(&mut DmaCtrlImpl(self.channel.reborrow()), buf)
     }
 
     /// Write an exact number of elements to the ringbuffer.
@@ -1031,7 +1106,9 @@ impl<'a, W: Word> WritableRingBuffer<'a, W> {
 
     /// The current length of the ringbuffer
     pub fn len(&mut self) -> Result<usize, Error> {
-        Ok(self.ringbuf.len(&mut DmaCtrlImpl(self.channel.reborrow()))?)
+        Ok(self
+            .ringbuf
+            .len(&mut DmaCtrlImpl(self.channel.reborrow()))?)
     }
 
     /// The capacity of the ringbuffer
