@@ -382,21 +382,33 @@ impl<'d> Channel<'d> {
                 state.complete_count.store(0, Ordering::Release);
                 self.clear_irqs();
 
-                // NDTR is the number of transfers in the *peripheral* word size.
-                // ex: if mem_size=1, peri_size=4 and ndtr=3 it'll do 12 mem transfers, 3 peri transfers.
-                let ndtr = match (mem_size, peri_size) {
-                    (WordSize::FourBytes, WordSize::OneByte) => mem_len * 4,
-                    (WordSize::FourBytes, WordSize::TwoBytes) | (WordSize::TwoBytes, WordSize::OneByte) => mem_len * 2,
-                    (WordSize::FourBytes, WordSize::FourBytes)
-                    | (WordSize::TwoBytes, WordSize::TwoBytes)
-                    | (WordSize::OneByte, WordSize::OneByte) => mem_len,
-                    (WordSize::TwoBytes, WordSize::FourBytes) | (WordSize::OneByte, WordSize::TwoBytes) => {
-                        assert!(mem_len % 2 == 0);
-                        mem_len / 2
+                // NDTR is the number of transfers in the *peripheral* word size (PSIZE).
+                // For M2M mode: PAR=source, M0AR=dest, so NDTR = source element count.
+                // For P2M/M2P: convert from mem_size units to peri_size units.
+                let ndtr = match dir {
+                    Dir::MemoryToMemory => {
+                        // In M2M mode, mem_len is passed as source element count (in peri_size units)
+                        mem_len
                     }
-                    (WordSize::OneByte, WordSize::FourBytes) => {
-                        assert!(mem_len % 4 == 0);
-                        mem_len / 4
+                    _ => {
+                        // ex: if mem_size=1, peri_size=4 and ndtr=3 it'll do 12 mem transfers, 3 peri transfers.
+                        match (mem_size, peri_size) {
+                            (WordSize::FourBytes, WordSize::OneByte) => mem_len * 4,
+                            (WordSize::FourBytes, WordSize::TwoBytes) | (WordSize::TwoBytes, WordSize::OneByte) => {
+                                mem_len * 2
+                            }
+                            (WordSize::FourBytes, WordSize::FourBytes)
+                            | (WordSize::TwoBytes, WordSize::TwoBytes)
+                            | (WordSize::OneByte, WordSize::OneByte) => mem_len,
+                            (WordSize::TwoBytes, WordSize::FourBytes) | (WordSize::OneByte, WordSize::TwoBytes) => {
+                                assert!(mem_len % 2 == 0);
+                                mem_len / 2
+                            }
+                            (WordSize::OneByte, WordSize::FourBytes) => {
+                                assert!(mem_len % 4 == 0);
+                                mem_len / 4
+                            }
+                        }
                     }
                 };
 
@@ -659,6 +671,9 @@ impl<'d> Channel<'d> {
     }
 
     /// Create a memory DMA transfer (memory to memory), using raw pointers.
+    ///
+    /// In M2M mode: PAR=source (peri_addr), M0AR=dest (mem_addr).
+    /// PSIZE controls source access width, MSIZE controls dest access width.
     pub unsafe fn transfer_raw<'a, MW: Word, PW: Word>(
         &'a mut self,
         request: Request,
@@ -672,12 +687,12 @@ impl<'d> Channel<'d> {
         self.configure(
             request,
             Dir::MemoryToMemory,
-            src_addr as *mut u32,
-            dest_addr as *mut u32,
-            src_size,
-            Increment::Peripheral,
-            MW::size(),
-            PW::size(),
+            src_addr as *mut u32,  // peri_addr → PAR (source)
+            dest_addr as *mut u32, // mem_addr → M0AR (dest)
+            src_size,              // source element count
+            Increment::Peripheral, // pinc=true (source increments), minc=false (dest fixed)
+            PW::size(),            // mem_size → MSIZE (dest word size)
+            MW::size(),            // peri_size → PSIZE (source word size)
             options,
         );
         self.start();
@@ -787,6 +802,45 @@ impl<'d> Channel<'d> {
             Increment::None,
             W::size(),
             W::size(),
+            options,
+        );
+        self.start();
+        Transfer {
+            _wake_guard: self.info().wake_guard(),
+            channel: self.reborrow(),
+        }
+    }
+
+    /// Create a DMA transfer to a memory-mapped peripheral (like FSMC).
+    ///
+    /// Uses memory-to-memory mode for automatic triggering (no peripheral request signal needed).
+    /// The source buffer address increments while the destination stays fixed.
+    ///
+    /// # Safety
+    /// - `buf` must point to a valid memory region
+    /// - `dest_addr` must be a valid memory-mapped peripheral address
+    /// - The memory must remain valid for the duration of the transfer
+    pub unsafe fn write_to_memory_mapped<'a, MW: Word, PW: Word>(
+        &'a mut self,
+        buf: *const [MW],
+        dest_addr: *mut PW,
+        options: TransferOptions,
+    ) -> Transfer<'a> {
+        let buf_len = buf.len();
+        let buf_ptr = buf as *const MW;
+        assert!(buf_len > 0 && buf_len <= 0xFFFF);
+
+        // In M2M mode: PAR=source, M0AR=dest
+        // PSIZE controls source access width, MSIZE controls dest access width
+        self.configure(
+            0, // request not used in M2M mode
+            Dir::MemoryToMemory,
+            buf_ptr as *mut u32,   // peri_addr → PAR (source, increments)
+            dest_addr as *mut u32, // mem_addr → M0AR (dest, fixed)
+            buf_len,               // source element count
+            Increment::Peripheral, // pinc=true (source increments), minc=false (dest fixed)
+            PW::size(),            // mem_size → MSIZE (dest word size)
+            MW::size(),            // peri_size → PSIZE (source word size)
             options,
         );
         self.start();
@@ -1051,7 +1105,7 @@ impl<'a, W: Word> ReadableRingBuffer<'a, W> {
             self.set_waker(cx.waker());
             self.channel.poll_stop()
         })
-        .await
+            .await
     }
 }
 
@@ -1203,7 +1257,7 @@ impl<'a, W: Word> WritableRingBuffer<'a, W> {
             self.set_waker(cx.waker());
             self.channel.poll_stop()
         })
-        .await
+            .await
     }
 }
 
